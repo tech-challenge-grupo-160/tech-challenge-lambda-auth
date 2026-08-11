@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, homolog]
+  push:
+    branches: [main, homolog]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write   # necessario para OIDC quando o deploy for habilitado (issue #54)
+
+jobs:
+  # Enquanto o runtime da Lambda nao for decidido na RFC (issue #35), este job
+  # cobre o que independe de linguagem: higiene do repositorio e ausencia de
+  # segredo commitado - critico porque o repositorio e publico.
+  hygiene:
+    name: Higiene do repositorio
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Arquivos obrigatorios presentes
+        run: |
+          fail=0
+          for f in README.md .gitignore .github/PULL_REQUEST_TEMPLATE.md; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Arquivo obrigatorio ausente: $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Nenhum arquivo de credencial versionado
+        run: |
+          # Repositorio publico: um .env ou .pem commitado vaza na hora.
+          found=$(git ls-files | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$|\.pfx$|id_rsa' || true)
+          if [ -n "$found" ]; then
+            echo "::error::Arquivos sensiveis versionados:"
+            echo "$found"
+            exit 1
+          fi
+          echo "OK - nenhum arquivo de credencial versionado."
+
+      - name: Nenhum segredo obvio no diff
+        if: github.event_name == 'pull_request'
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          # Heuristica simples e sem dependencia externa. Nao substitui uma
+          # ferramenta de secret scanning - ver issue #46.
+          hits=$(git diff "$base" "$head" -U0 \
+            | grep -E '^\+' \
+            | grep -inE '(aws_secret_access_key|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|password[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{8,})' \
+            || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Possivel segredo no diff:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK - nada suspeito no diff."
+
+  workflows:
+    name: Sintaxe dos workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Valida YAML dos workflows
+        run: |
+          python3 - <<'PY'
+          import sys, glob, yaml
+          erros = 0
+          for f in glob.glob('.github/workflows/*.yml') + glob.glob('.github/workflows/*.yaml'):
+              try:
+                  yaml.safe_load(open(f, encoding='utf-8'))
+                  print(f'ok   {f}')
+              except Exception as e:
+                  print(f'ERRO {f}: {e}')
+                  erros += 1
+          sys.exit(1 if erros else 0)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Os jobs abaixo entram quando o runtime for definido na RFC (issue #35).
+  # Estao declarados para deixar explicito o que falta, e desabilitados para
+  # nao dar falsa sensacao de cobertura.
+  # ---------------------------------------------------------------------------
+
+  build:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    needs: [hygiene, workflows]
+    if: false   # habilitar junto com a implementacao (issues #36, #41)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Placeholder
+        run: |
+          echo "Build e testes da Lambda entram aqui."
+          echo "Depende do runtime definido na RFC #35."
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: false   # habilitar quando o OIDC existir (issue #54)
+    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # - name: Autenticar na nuvem via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+      #     aws-region: ${{ vars.AWS_REGION }}
+      - name: Placeholder
+        run: echo "Deploy da Lambda entra aqui - issue #50."
