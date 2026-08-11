@@ -52,11 +52,15 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
-          # Heuristica simples e sem dependencia externa. Nao substitui uma
-          # ferramenta de secret scanning - ver issue #46.
+          # Os padroes ficam em arquivo separado, e esse arquivo e excluido do
+          # diff analisado: com as regex aqui dentro, o proprio workflow entrava
+          # no diff do PR e casava consigo mesmo, falhando o job.
+          # Heuristica simples, sem dependencia externa. Nao substitui uma
+          # ferramenta dedicada de secret scanning - ver issue #46.
           hits=$(git diff "$base" "$head" -U0 \
+              -- . ':(exclude).github/secret-patterns.txt' \
             | grep -E '^\+' \
-            | grep -inE '(aws_secret_access_key|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|password[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{8,})' \
+            | grep -inE -f .github/secret-patterns.txt \
             || true)
           if [ -n "$hits" ]; then
             echo "::error::Possivel segredo no diff:"
