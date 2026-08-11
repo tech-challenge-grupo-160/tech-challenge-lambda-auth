@@ -1,0 +1,17 @@
+# Dependencias
+node_modules/
+__pycache__/
+*.pyc
+bin/
+obj/
+
+# Build
+dist/
+build/
+*.zip
+
+# Credenciais - nunca versionar
+.env
+.env.*
+*.pem
+*.key
