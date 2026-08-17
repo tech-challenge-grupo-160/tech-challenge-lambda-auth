@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Fiap.TechChallenge.OficinaMecanica.AuthLambda/Fiap.TechChallenge.OficinaMecanica.AuthLambda.csproj" />
+  <Project Path="tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests.csproj" />
+</Solution>

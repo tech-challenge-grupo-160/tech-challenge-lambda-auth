@@ -1,76 +1,109 @@
 # tech-challenge-lambda-auth
 
-Function Serverless de autenticação por CPF do Sistema de Gestão de Oficina Mecânica — Tech Challenge SOAT, Fase 3.
+Function Serverless de autenticacao de cliente final do Sistema de Gestao de Oficina Mecanica - Tech Challenge SOAT, Fase 3.
 
-## Propósito
+## Proposito
 
-Este repositório contém a função serverless que fica atrás do API Gateway e responde pela autenticação:
+Este repositorio contem a Lambda responsavel por autenticar o cliente final por documento e emitir um JWT para consumo das APIs protegidas da aplicacao principal.
 
-1. Valida o CPF informado (formato e dígitos verificadores)
-2. Consulta a existência e o status do cliente no banco de dados gerenciado
-3. Gera e devolve um token JWT válido para consumo das APIs protegidas
+Responsabilidades desta Function:
 
-Nenhuma outra responsabilidade pertence a este repositório. Regras de negócio de oficina ficam na [aplicação principal](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica).
+1. Receber a chamada via API Gateway com Lambda Proxy Integration.
+2. Validar CPF ou CNPJ, incluindo digitos verificadores.
+3. Consultar o cliente no PostgreSQL pela coluna `Cliente.CpfCnpj`.
+4. Validar se o cliente esta com status `Ativo`.
+5. Gerar e devolver um JWT com role `Cliente`.
 
-## Status
-
-> ⚠️ **Scaffold.** O runtime e a linguagem ainda não foram decididos — dependem da RFC de estratégia de autenticação ([issue #35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35)). Este README será completado quando a implementação começar.
+Regras administrativas da oficina continuam na API principal.
 
 ## Tecnologias
 
-| Item | Definição |
+| Item | Definicao |
 |---|---|
-| Runtime | A definir — RFC [#35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35) |
-| Provedor serverless | A definir — RFC [#56](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/56) |
-| Banco consultado | PostgreSQL gerenciado — provisionado em [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) |
-| Segredos | Gerenciador de segredos da nuvem (chave de assinatura do JWT) |
+| Runtime | .NET 10 |
+| Provider serverless | AWS Lambda |
+| Entrada HTTP | AWS API Gateway com Lambda Proxy Integration |
+| Banco consultado | PostgreSQL / AWS RDS |
+| Token | JWT assinado com HMAC SHA-256 |
 
 ## Contrato
 
-### Requisição
+Endpoint esperado no API Gateway:
 
+```http
+POST /api/v1/auth/cliente/login
 ```
-POST /auth
-{ "cpf": "12345678909" }
+
+Payload:
+
+```json
+{
+  "documento": "476.548.668-01"
+}
 ```
 
-### Respostas
+Tambem sao aceitos os aliases `cpfCnpj` e `cpf` por compatibilidade.
 
-| Código | Situação |
+Resposta de sucesso:
+
+```json
+{
+  "token": "...",
+  "expiraEm": "2026-08-17T23:58:02.8162589Z",
+  "nomeUsuario": "Vanessa Luna Duarte",
+  "role": "Cliente"
+}
+```
+
+## Configuracao
+
+Variaveis aceitas:
+
+| Variavel | Descricao |
 |---|---|
-| `200` | CPF válido e cliente ativo — retorna o JWT |
-| `400` | CPF inválido (formato ou dígito verificador) |
-| `403` | Cliente encontrado, porém inativo |
-| `404` | Cliente não encontrado |
+| `ConnectionStrings__DefaultConnection` ou `DATABASE_CONNECTION_STRING` | Connection string do PostgreSQL |
+| `Jwt__Issuer` ou `JWT_ISSUER` | Emissor do token |
+| `Jwt__Audience` ou `JWT_AUDIENCE` | Audiencia do token |
+| `Jwt__SecretKey` ou `JWT_SECRET_KEY` | Chave de assinatura do token |
+| `Jwt__ExpirationMinutes` ou `JWT_EXPIRATION_MINUTES` | Tempo de expiracao em minutos |
 
-O formato e as claims do token são definidos na RFC [#35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35) e precisam ser aceitos pela API principal.
+## Execucao local
 
-## Execução local
+Com o Postgres local em Docker:
 
-_A ser documentado junto com a implementação ([issue #36](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/36))._
+```powershell
+dotnet lambda-test-tool-10.0 --project-location .\Fiap.TechChallenge.OficinaMecanica.AuthLambda
+```
 
-## Deploy
+Exemplo de payload para o Mock Lambda Test Tool:
 
-Deploy automático via GitHub Actions ([issue #50](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/50)), autenticando na nuvem por OIDC — sem chave estática.
+```json
+{
+  "httpMethod": "POST",
+  "body": "{\"documento\":\"476.548.668-01\"}",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "path": "/api/v1/auth/cliente/login",
+  "resource": "/api/v1/auth/cliente/login",
+  "isBase64Encoded": false
+}
+```
 
-| Branch | Ambiente |
+## Testes
+
+```powershell
+dotnet test .\tests\Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests\Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests.csproj
+```
+
+Os testes unitarios cobrem `Documento`, `AuthService` e `JwtTokenGenerator`.
+
+O `ClienteRepository` deve ser coberto por teste de integracao, pois consulta PostgreSQL real.
+
+## Repositorios do projeto
+
+| Repositorio | Conteudo |
 |---|---|
-| `homolog` | Homologação |
-| `main` | Produção |
-
-## Arquitetura
-
-O diagrama de arquitetura na nuvem está em [docs/diagrams](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/blob/master/docs/diagrams) no repositório principal. Esta função é o componente **Lambda Auth**, em subnet privada.
-
-## Repositórios do projeto
-
-| Repositório | Conteúdo |
-|---|---|
-| [tech-challenge-oficina-mecanica](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica) | API .NET e documentação |
-| [tech-challenge-lambda-auth](https://github.com/tech-challenge-grupo-160/tech-challenge-lambda-auth) | Este repositório |
-| [tech-challenge-infra-k8s](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-k8s) | Terraform do cluster Kubernetes |
-| [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) | Terraform do banco gerenciado |
-
-## Contribuição
-
-Branch `main` protegida — sem commits diretos. Toda mudança entra por Pull Request com pelo menos uma aprovação.
+| [tech-challenge-oficina-mecanica](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica) | API .NET e documentacao |
+| [tech-challenge-lambda-auth](https://github.com/tech-challenge-grupo-160/tech-challenge-lambda-auth) | Esta Lambda de autenticacao |
+| [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) | Infraestrutura do banco gerenciado |

@@ -1,0 +1,17 @@
+{
+  "profiles": {
+    "Mock Lambda Test Tool": {
+      "commandName": "Executable",
+      "commandLineArgs": "--port 5050",
+      "workingDirectory": ".\\bin\\$(Configuration)\\net10.0",
+      "executablePath": "%USERPROFILE%\\.dotnet\\tools\\dotnet-lambda-test-tool-10.0.exe",
+      "environmentVariables": {
+        "ConnectionStrings__DefaultConnection": "Host=127.0.0.1;Port=5432;Database=oficina_mecanica;Username=postgres;Password=postgres",
+        "Jwt__Issuer": "Fiap.TechChallenge.OficinaMecanica",
+        "Jwt__Audience": "Fiap.TechChallenge.OficinaMecanica",
+        "Jwt__SecretKey": "local-development-secret-key-32chars",
+        "Jwt__ExpirationMinutes": "60"
+      }
+    }
+  }
+}
