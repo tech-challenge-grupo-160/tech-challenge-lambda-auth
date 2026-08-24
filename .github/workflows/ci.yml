@@ -7,15 +7,22 @@ on:
     branches: [develop, homolog, main]
   workflow_dispatch:
 
+env:
+  DOTNET_VERSION: '10.0.x'
+  BUILD_CONFIGURATION: 'Release'
+  SOLUTION_FILE: 'Fiap.TechChallenge.OficinaMecanica.AuthLambda.slnx'
+  TEST_PROJECT: 'tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests.csproj'
+  COVERAGE_SETTINGS: 'coverlet.runsettings'
+
 permissions:
   contents: read
   pull-requests: read
   id-token: write   # necessario para OIDC quando o deploy for habilitado (issue #54)
 
 jobs:
-  # Enquanto o runtime da Lambda nao for decidido na RFC (issue #35), este job
-  # cobre o que independe de linguagem: higiene do repositorio e ausencia de
-  # segredo commitado - critico porque o repositorio e publico.
+  # Alem do build, este job cobre o que independe de linguagem: higiene do
+  # repositorio e ausencia de segredo commitado - critico porque o repositorio
+  # e publico.
   hygiene:
     name: Higiene do repositorio
     runs-on: ubuntu-latest
@@ -101,15 +108,60 @@ jobs:
     name: Build e testes
     runs-on: ubuntu-latest
     needs: [hygiene, workflows]
-    if: false   # habilitar junto com a implementacao (issues #36, #41)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Placeholder
-        run: |
-          echo "Build e testes da Lambda entram aqui."
-          echo "Depende do runtime definido na RFC #35."
 
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Show .NET information
+        run: dotnet --info
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+      - name: Build solution
+        run: >
+          dotnet build ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+
+      - name: Run unit tests
+        run: >
+          dotnet test ${{ env.TEST_PROJECT }}
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-build
+          --no-restore
+          --verbosity normal
+          --collect:"XPlat Code Coverage"
+          --settings ${{ env.COVERAGE_SETTINGS }}
+          --logger "trx;LogFileName=unit-tests.trx"
+          --results-directory TestResults
+
+      - name: Resumo da cobertura
+        if: always()
+        run: |
+          file=$(find TestResults -name 'coverage.cobertura.xml' | head -1)
+          if [ -z "$file" ]; then
+            echo "::warning::Relatorio de cobertura nao encontrado."
+            exit 0
+          fi
+          # line-rate vem como fracao (ex.: 0.8123) no atributo raiz do cobertura
+          rate=$(grep -o 'line-rate="[0-9.]*"' "$file" | head -1 | grep -o '[0-9.]*')
+          pct=$(awk -v r="$rate" 'BEGIN { printf "%.1f", r * 100 }')
+          echo "Cobertura de linhas: ${pct}%"
+          echo "### Cobertura de linhas: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publica resultados dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          retention-days: 7
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
