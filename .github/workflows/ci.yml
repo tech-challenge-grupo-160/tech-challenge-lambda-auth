@@ -64,9 +64,13 @@ jobs:
           # no diff do PR e casava consigo mesmo, falhando o job.
           # Heuristica simples, sem dependencia externa. Nao substitui uma
           # ferramenta dedicada de secret scanning - ver issue #46.
+          # Referencias no formato ${{ secrets.X }} sao a forma correta de usar
+          # segredo em workflow: a linha aponta para o cofre, nao expoe o valor.
+          # Sem esta exclusao, configurar credenciais na AWS falha o proprio job.
           hits=$(git diff "$base" "$head" -U0 \
               -- . ':(exclude).github/secret-patterns.txt' \
             | grep -E '^\+' \
+            | grep -v 'secrets\.' \
             | grep -inE -f .github/secret-patterns.txt \
             || true)
           if [ -n "$hits" ]; then
