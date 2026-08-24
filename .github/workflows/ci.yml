@@ -6,6 +6,12 @@ on:
   push:
     branches: [develop, homolog, main]
   workflow_dispatch:
+    inputs:
+      ambiente:
+        description: "Ambiente de destino do deploy"
+        type: choice
+        options: [homologacao, producao]
+        default: homologacao
 
 env:
   DOTNET_VERSION: '10.0.x'
@@ -201,15 +207,81 @@ jobs:
     name: Deploy
     runs-on: ubuntu-latest
     needs: build
-    if: false   # habilitar quando o OIDC existir (#54), gateando por homolog|main
-    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    # Deploy so a partir das branches de ambiente. O workflow_dispatch existe
+    # para validar o pipeline sem precisar promover uma branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (github.ref_name == 'homolog' || github.ref_name == 'main'))
+    environment: ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      # - name: Autenticar na nuvem via OIDC
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
-      #     aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-      - name: Placeholder
-        run: echo "Deploy da Lambda entra aqui - issue #50."
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Diferente do job de build, aqui a credencial e obrigatoria: sem ela
+      # nao ha deploy. Falhar e o comportamento correto.
+      - name: Exige credenciais da sessao
+        env:
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::Sem credenciais da AWS. Rode scripts/renova-secrets.sh no repo de infra."
+            exit 1
+          fi
+
+      - name: Autenticar na AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Instalar Amazon.Lambda.Tools
+        run: dotnet tool install -g Amazon.Lambda.Tools
+
+      - name: Resolver nome da funcao e role
+        id: alvo
+        run: |
+          AMBIENTE="${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }}"
+          SUFIXO="hom"; [ "$AMBIENTE" = "producao" ] && SUFIXO="prod"
+          # O id da conta vem em runtime: o repositorio e publico.
+          CONTA="$(aws sts get-caller-identity --query Account --output text)"
+          echo "funcao=tc-grupo160-auth-${SUFIXO}" >> "$GITHUB_OUTPUT"
+          echo "role=arn:aws:iam::${CONTA}:role/LabRole" >> "$GITHUB_OUTPUT"
+          echo "Ambiente: $AMBIENTE  Funcao: tc-grupo160-auth-${SUFIXO}"
+
+      - name: Deploy da funcao
+        run: |
+          # deploy-function cria ou atualiza, entao serve para os dois casos.
+          dotnet lambda deploy-function "${{ steps.alvo.outputs.funcao }}" \
+            --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+            --configuration ${{ env.BUILD_CONFIGURATION }} \
+            --function-role "${{ steps.alvo.outputs.role }}" \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+      - name: Confirmar funcao publicada
+        run: |
+          aws lambda get-function \
+            --function-name "${{ steps.alvo.outputs.funcao }}" \
+            --query '{Nome:Configuration.FunctionName,Runtime:Configuration.Runtime,Estado:Configuration.State,Tamanho:Configuration.CodeSize}' \
+            --output table
+
+      - name: Resumo
+        run: |
+          {
+            echo "### Deploy concluido"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Funcao | \`${{ steps.alvo.outputs.funcao }}\` |"
+            echo "| Ambiente | ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }} |"
+            echo "| Regiao | ${{ vars.AWS_REGION || 'us-east-1' }} |"
+            echo ""
+            echo "> A funcao ainda nao tem variaveis de ambiente de banco e JWT."
+            echo "> Elas entram com as issues #61 (RDS) e #46 (Secrets Manager)."
+          } >> "$GITHUB_STEP_SUMMARY"
