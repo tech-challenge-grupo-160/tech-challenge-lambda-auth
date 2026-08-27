@@ -266,7 +266,41 @@ jobs:
           # Nome do segredo, nunca o valor. Criado pelo Terraform em
           # tech-challenge-infra-k8s (issue #46).
           echo "segredo_jwt=tc-grupo160/${SUFIXO}/jwt-signing-key" >> "$GITHUB_OUTPUT"
+          # Credencial do banco, criada pelo Terraform em
+          # tech-challenge-infra-database (issue #61).
+          echo "segredo_banco=tc-grupo160/${SUFIXO}/banco" >> "$GITHUB_OUTPUT"
+          echo "sufixo=${SUFIXO}" >> "$GITHUB_OUTPUT"
           echo "Ambiente: $AMBIENTE  Funcao: tc-grupo160-auth-${SUFIXO}"
+
+      # A funcao precisa entrar na VPC para alcancar o RDS, que fica em subnet
+      # privada sem acesso publico. Dentro da VPC ela perde a saida para a
+      # internet - nao ha NAT Gateway - e passa a depender do endpoint de
+      # interface do Secrets Manager, criado junto com a rede.
+      #
+      # Os ids sao descobertos por tag em runtime, e nao guardados em variavel
+      # do repositorio: mudariam a cada recriacao do ambiente do lab.
+      - name: Resolver rede da funcao
+        id: rede
+        run: |
+          SUFIXO="${{ steps.alvo.outputs.sufixo }}"
+          SUBNETS="$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-privada-*" \
+            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
+          SG="$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-lambda" \
+            --query 'SecurityGroups[0].GroupId' --output text)"
+
+          if [ -z "$SUBNETS" ] || [ "$SG" = "None" ] || [ -z "$SG" ]; then
+            # Sem rede aplicada nao ha banco para alcancar tambem, entao publicar
+            # fora da VPC mantem o pipeline util em vez de falhar.
+            echo "::warning::Rede do ambiente ${SUFIXO} nao encontrada. Publicando fora da VPC - a funcao nao alcancara o banco. Aplique o Terraform de tech-challenge-infra-k8s."
+            echo "vpc=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "vpc=true" >> "$GITHUB_OUTPUT"
+            echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+            echo "sg=$SG" >> "$GITHUB_OUTPUT"
+            echo "Subnets: $SUBNETS  SG: $SG"
+          fi
 
       - name: Deploy da funcao
         run: |
@@ -274,12 +308,23 @@ jobs:
           # JWT_SECRET_ID carrega o NOME do segredo; a Lambda le o valor do
           # Secrets Manager no cold start. Nenhum segredo trafega aqui nem
           # fica visivel na configuracao da funcao.
+          # As duas variaveis carregam NOMES de segredo. Nenhuma credencial
+          # trafega aqui nem fica visivel na configuracao da funcao.
+          ENVS="JWT_SECRET_ID=${{ steps.alvo.outputs.segredo_jwt }};DB_SECRET_ID=${{ steps.alvo.outputs.segredo_banco }}"
+
+          REDE=""
+          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+            REDE="--subnets ${{ steps.rede.outputs.subnets }} --security-groups ${{ steps.rede.outputs.sg }}"
+          fi
+
+          # shellcheck disable=SC2086
           dotnet lambda deploy-function "${{ steps.alvo.outputs.funcao }}" \
             --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
             --configuration ${{ env.BUILD_CONFIGURATION }} \
             --function-role "${{ steps.alvo.outputs.role }}" \
             --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
-            --environment-variables "JWT_SECRET_ID=${{ steps.alvo.outputs.segredo_jwt }}"
+            --environment-variables "$ENVS" \
+            $REDE
 
       - name: Confirmar funcao publicada
         run: |
@@ -299,7 +344,14 @@ jobs:
             echo "| Ambiente | ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }} |"
             echo "| Regiao | ${{ vars.AWS_REGION || 'us-east-1' }} |"
             echo "| Segredo do JWT | \`${{ steps.alvo.outputs.segredo_jwt }}\` |"
-            echo ""
-            echo "> A funcao ainda nao tem a variavel de conexao com o banco."
-            echo "> Ela entra com a issue #61 (RDS)."
+            echo "| Segredo do banco | \`${{ steps.alvo.outputs.segredo_banco }}\` |"
+            echo "| Dentro da VPC | ${{ steps.rede.outputs.vpc }} |"
+            if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+              echo "| Subnets | \`${{ steps.rede.outputs.subnets }}\` |"
+              echo "| Security group | \`${{ steps.rede.outputs.sg }}\` |"
+            else
+              echo ""
+              echo "> Publicada **fora da VPC**: a rede do ambiente nao foi encontrada."
+              echo "> A funcao nao alcanca o banco. Aplique o Terraform de tech-challenge-infra-k8s."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
