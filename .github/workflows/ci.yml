@@ -253,16 +253,23 @@ jobs:
           CONTA="$(aws sts get-caller-identity --query Account --output text)"
           echo "funcao=tc-grupo160-auth-${SUFIXO}" >> "$GITHUB_OUTPUT"
           echo "role=arn:aws:iam::${CONTA}:role/LabRole" >> "$GITHUB_OUTPUT"
+          # Nome do segredo, nunca o valor. Criado pelo Terraform em
+          # tech-challenge-infra-k8s (issue #46).
+          echo "segredo_jwt=tc-grupo160/${SUFIXO}/jwt-signing-key" >> "$GITHUB_OUTPUT"
           echo "Ambiente: $AMBIENTE  Funcao: tc-grupo160-auth-${SUFIXO}"
 
       - name: Deploy da funcao
         run: |
           # deploy-function cria ou atualiza, entao serve para os dois casos.
+          # JWT_SECRET_ID carrega o NOME do segredo; a Lambda le o valor do
+          # Secrets Manager no cold start. Nenhum segredo trafega aqui nem
+          # fica visivel na configuracao da funcao.
           dotnet lambda deploy-function "${{ steps.alvo.outputs.funcao }}" \
             --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
             --configuration ${{ env.BUILD_CONFIGURATION }} \
             --function-role "${{ steps.alvo.outputs.role }}" \
-            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
+            --environment-variables "JWT_SECRET_ID=${{ steps.alvo.outputs.segredo_jwt }}"
 
       - name: Confirmar funcao publicada
         run: |
@@ -281,7 +288,8 @@ jobs:
             echo "| Funcao | \`${{ steps.alvo.outputs.funcao }}\` |"
             echo "| Ambiente | ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }} |"
             echo "| Regiao | ${{ vars.AWS_REGION || 'us-east-1' }} |"
+            echo "| Segredo do JWT | \`${{ steps.alvo.outputs.segredo_jwt }}\` |"
             echo ""
-            echo "> A funcao ainda nao tem variaveis de ambiente de banco e JWT."
-            echo "> Elas entram com as issues #61 (RDS) e #46 (Secrets Manager)."
+            echo "> A funcao ainda nao tem a variavel de conexao com o banco."
+            echo "> Ela entra com a issue #61 (RDS)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -9,7 +9,7 @@
         "ConnectionStrings__DefaultConnection": "Host=127.0.0.1;Port=5432;Database=oficina_mecanica;Username=postgres;Password=postgres",
         "Jwt__Issuer": "Fiap.TechChallenge.OficinaMecanica",
         "Jwt__Audience": "Fiap.TechChallenge.OficinaMecanica",
-        "Jwt__SecretKey": "local-development-secret-key-32chars",
+        "Jwt__SecretKey": "apenas-execucao-local-nao-e-chave-real-256bits",
         "Jwt__ExpirationMinutes": "60"
       }
     }

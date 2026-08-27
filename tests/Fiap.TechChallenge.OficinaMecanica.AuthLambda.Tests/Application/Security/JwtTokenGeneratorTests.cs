@@ -15,7 +15,7 @@ public sealed class JwtTokenGeneratorTests
         {
             Issuer = "issuer-test",
             Audience = "audience-test",
-            SecretKey = "local-development-secret-key-32chars",
+            SecretKey = "apenas-execucao-local-nao-e-chave-real-256bits",
             ExpirationMinutes = 60
         });
         var cliente = new ClienteAutenticado(
