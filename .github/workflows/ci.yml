@@ -10,8 +10,8 @@ on:
       ambiente:
         description: "Ambiente de destino do deploy"
         type: choice
-        options: [homologacao, producao]
-        default: homologacao
+        options: [desenvolvimento, homologacao, producao]
+        default: desenvolvimento
 
 env:
   DOTNET_VERSION: '10.0.x'
@@ -207,8 +207,10 @@ jobs:
     name: Deploy
     runs-on: ubuntu-latest
     needs: build
-    # Deploy so a partir das branches de ambiente. O workflow_dispatch existe
-    # para validar o pipeline sem precisar promover uma branch.
+    # Por push, so a partir das branches de ambiente: homolog publica hom e
+    # main publica prod. O workflow_dispatch publica o ambiente escolhido a
+    # partir de qualquer branch - e como se publica em dev, e como se valida o
+    # pipeline sem promover branch.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && (github.ref_name == 'homolog' || github.ref_name == 'main'))
@@ -248,7 +250,15 @@ jobs:
         id: alvo
         run: |
           AMBIENTE="${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }}"
-          SUFIXO="hom"; [ "$AMBIENTE" = "producao" ] && SUFIXO="prod"
+          # O sufixo casa com var.ambiente do Terraform em infra-k8s: e dele que
+          # saem o nome da funcao (tc-grupo160-auth-<sufixo>) e o do segredo
+          # (tc-grupo160/<sufixo>/jwt-signing-key). Divergir aqui quebra a
+          # integracao do API Gateway silenciosamente.
+          case "$AMBIENTE" in
+            desenvolvimento) SUFIXO="dev" ;;
+            producao)        SUFIXO="prod" ;;
+            *)               SUFIXO="hom" ;;
+          esac
           # O id da conta vem em runtime: o repositorio e publico.
           CONTA="$(aws sts get-caller-identity --query Account --output text)"
           echo "funcao=tc-grupo160-auth-${SUFIXO}" >> "$GITHUB_OUTPUT"
