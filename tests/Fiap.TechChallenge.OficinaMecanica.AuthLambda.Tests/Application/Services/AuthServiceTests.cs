@@ -83,7 +83,12 @@ public sealed class AuthServiceTests
 
     private static AuthService CriarService(IClienteRepository repository)
     {
-        return new AuthService(repository, new JwtTokenGenerator(new JwtOptions()));
+        return new AuthService(
+            repository,
+            new JwtTokenGenerator(new JwtOptions
+            {
+                SecretKey = "chave-de-teste-com-tamanho-suficiente-256bits"
+            }));
     }
 
     private sealed class FakeClienteRepository : IClienteRepository
