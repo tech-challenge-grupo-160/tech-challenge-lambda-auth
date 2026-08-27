@@ -283,55 +283,103 @@ jobs:
         id: rede
         run: |
           SUFIXO="${{ steps.alvo.outputs.sufixo }}"
+          # JSON, nao shorthand: os ids vao para --vpc-config do AWS CLI, e a
+          # forma shorthand com lista separada por virgula e ambigua.
           SUBNETS="$(aws ec2 describe-subnets \
             --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-privada-*" \
-            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
+            --query 'Subnets[].SubnetId' --output json | tr -d ' \n')"
           SG="$(aws ec2 describe-security-groups \
             --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-lambda" \
             --query 'SecurityGroups[0].GroupId' --output text)"
 
-          if [ -z "$SUBNETS" ] || [ "$SG" = "None" ] || [ -z "$SG" ]; then
+          if [ "$SUBNETS" = "[]" ] || [ -z "$SUBNETS" ] || [ "$SG" = "None" ] || [ -z "$SG" ]; then
             # Sem rede aplicada nao ha banco para alcancar tambem, entao publicar
             # fora da VPC mantem o pipeline util em vez de falhar.
             echo "::warning::Rede do ambiente ${SUFIXO} nao encontrada. Publicando fora da VPC - a funcao nao alcancara o banco. Aplique o Terraform de tech-challenge-infra-k8s."
             echo "vpc=false" >> "$GITHUB_OUTPUT"
           else
             echo "vpc=true" >> "$GITHUB_OUTPUT"
-            echo "subnets=$SUBNETS" >> "$GITHUB_OUTPUT"
+            echo "vpc_config={\"SubnetIds\":${SUBNETS},\"SecurityGroupIds\":[\"${SG}\"]}" >> "$GITHUB_OUTPUT"
             echo "sg=$SG" >> "$GITHUB_OUTPUT"
             echo "Subnets: $SUBNETS  SG: $SG"
           fi
 
+      # Publica apenas o codigo. Rede e variaveis entram no passo seguinte, pelo
+      # AWS CLI.
+      #
+      # O deploy-function nao reconhece --subnets nem --security-groups: em vez
+      # de recusar, tratou o id do security group como argumento posicional e
+      # criou uma funcao chamada "sg-09a565a4b2ca31faf", deixando a funcao de
+      # verdade intocada e o job verde. Nao passe parametro que a ferramenta nao
+      # documenta aqui.
       - name: Deploy da funcao
         run: |
           # deploy-function cria ou atualiza, entao serve para os dois casos.
-          # JWT_SECRET_ID carrega o NOME do segredo; a Lambda le o valor do
-          # Secrets Manager no cold start. Nenhum segredo trafega aqui nem
-          # fica visivel na configuracao da funcao.
-          # As duas variaveis carregam NOMES de segredo. Nenhuma credencial
-          # trafega aqui nem fica visivel na configuracao da funcao.
-          ENVS="JWT_SECRET_ID=${{ steps.alvo.outputs.segredo_jwt }};DB_SECRET_ID=${{ steps.alvo.outputs.segredo_banco }}"
-
-          REDE=""
-          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
-            REDE="--subnets ${{ steps.rede.outputs.subnets }} --security-groups ${{ steps.rede.outputs.sg }}"
-          fi
-
-          # shellcheck disable=SC2086
           dotnet lambda deploy-function "${{ steps.alvo.outputs.funcao }}" \
             --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
             --configuration ${{ env.BUILD_CONFIGURATION }} \
             --function-role "${{ steps.alvo.outputs.role }}" \
-            --region "${{ vars.AWS_REGION || 'us-east-1' }}" \
-            --environment-variables "$ENVS" \
-            $REDE
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
 
+      # As duas variaveis carregam NOMES de segredo. Nenhuma credencial trafega
+      # aqui nem fica visivel na configuracao da funcao.
+      - name: Configurar rede e variaveis de ambiente
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.funcao }}"
+          ENVS='{"Variables":{"JWT_SECRET_ID":"${{ steps.alvo.outputs.segredo_jwt }}","DB_SECRET_ID":"${{ steps.alvo.outputs.segredo_banco }}"}}'
+
+          # A funcao fica em Pending logo apos o deploy do codigo; alterar a
+          # configuracao antes disso devolve ResourceConflictException.
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+            aws lambda update-function-configuration \
+              --function-name "$FUNCAO" \
+              --environment "$ENVS" \
+              --vpc-config '${{ steps.rede.outputs.vpc_config }}' >/dev/null
+          else
+            aws lambda update-function-configuration \
+              --function-name "$FUNCAO" \
+              --environment "$ENVS" >/dev/null
+          fi
+
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+      # Verifica o resultado, nao so o codigo de saida dos passos anteriores.
+      # O deploy que criou a funcao errada terminou verde: todos os passos
+      # retornaram zero e a funcao de verdade continuou intocada. So uma
+      # asercao sobre o estado final pega esse tipo de falha.
       - name: Confirmar funcao publicada
         run: |
+          FUNCAO="${{ steps.alvo.outputs.funcao }}"
+          CONF="$(aws lambda get-function-configuration --function-name "$FUNCAO" --output json)"
+
           aws lambda get-function \
-            --function-name "${{ steps.alvo.outputs.funcao }}" \
+            --function-name "$FUNCAO" \
             --query '{Nome:Configuration.FunctionName,Runtime:Configuration.Runtime,Estado:Configuration.State,Tamanho:Configuration.CodeSize}' \
             --output table
+
+          falhas=0
+          for var in JWT_SECRET_ID DB_SECRET_ID; do
+            if ! echo "$CONF" | grep -q "\"$var\""; then
+              echo "::error::$var ausente na configuracao de $FUNCAO."
+              falhas=$((falhas + 1))
+            fi
+          done
+
+          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+            if ! echo "$CONF" | grep -q "${{ steps.rede.outputs.sg }}"; then
+              echo "::error::A funcao $FUNCAO nao ficou na VPC: security group ${{ steps.rede.outputs.sg }} ausente."
+              falhas=$((falhas + 1))
+            fi
+          fi
+
+          # Uma funcao publicada ha muito tempo significa que o deploy foi para
+          # outro lugar - foi exatamente o sintoma da funcao "sg-...".
+          MOD="$(echo "$CONF" | grep -o '"LastModified": *"[^"]*"' | head -1)"
+          echo "Ultima modificacao: $MOD"
+
+          exit $falhas
 
       - name: Resumo
         run: |
