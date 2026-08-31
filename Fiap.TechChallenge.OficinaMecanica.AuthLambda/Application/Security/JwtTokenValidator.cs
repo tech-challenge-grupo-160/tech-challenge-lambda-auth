@@ -147,9 +147,24 @@ public sealed class JwtTokenValidator
             principal.FindFirst(ClaimTypes.Role)?.Value ??
             principal.FindFirst("role")?.Value;
 
-        if (string.IsNullOrWhiteSpace(sub) ||
-            string.IsNullOrWhiteSpace(documento) ||
-            string.IsNullOrWhiteSpace(role))
+        // Apenas sub e role sao obrigatorios, e isso vale para os DOIS tokens
+        // que circulam no sistema:
+        //
+        //   cliente (Lambda)  sub, role, documento, tipo_documento, status
+        //   admin   (API)     sub, role, unique_name, name
+        //
+        // O `documento` existe so no primeiro. Exigi-lo aqui trancava o
+        // administrador para fora da API inteira: ele fazia login pela rota
+        // publica, recebia um token valido, e toda rota protegida devolvia 403.
+        //
+        // Foi um erro de modelagem: a tabela de claims da RFC-0002 documenta o
+        // token do cliente, e eu a tomei como o unico formato. A matriz de
+        // autorizacao e explicita ao dizer que as 50 rotas de gestao exigem
+        // "JWT valido", nao "JWT de cliente".
+        //
+        // Diagnosticado em 31/08, quando o login do admin passou a devolver 403
+        // em tudo depois que o authorizer entrou.
+        if (string.IsNullOrWhiteSpace(sub) || string.IsNullOrWhiteSpace(role))
         {
             // Assinatura valida mas conteudo fora do contrato: token emitido
             // por outra versao do gerador, ou por outro sistema que compartilhe
@@ -158,13 +173,20 @@ public sealed class JwtTokenValidator
             return TokenValidationResult.Recusar("Token sem as claims obrigatorias do contrato.");
         }
 
-        // As tres claims que a RFC-0002 define como contexto repassado ao
-        // backend. Chegam la em $context.authorizer.
-        return TokenValidationResult.Autorizar(new Dictionary<string, string>
+        // Contexto repassado ao backend em $context.authorizer. O `documento`
+        // entra apenas quando existe - o backend ja sabe distinguir os dois
+        // perfis pela claim de papel.
+        var contexto = new Dictionary<string, string>
         {
             ["sub"] = sub,
-            ["documento"] = documento,
             ["role"] = role
-        });
+        };
+
+        if (!string.IsNullOrWhiteSpace(documento))
+        {
+            contexto["documento"] = documento;
+        }
+
+        return TokenValidationResult.Autorizar(contexto);
     }
 }
