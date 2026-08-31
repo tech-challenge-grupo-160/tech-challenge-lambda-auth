@@ -90,6 +90,56 @@ public sealed class JwtTokenValidatorTests
         Assert.Equal("Audience invalida.", resultado.Motivo);
     }
 
+    /// <summary>
+    /// O token do administrador vem da API .NET, nao da Lambda, e nao tem a
+    /// claim <c>documento</c> - ela so existe no fluxo de autenticacao por CPF.
+    ///
+    /// Exigir <c>documento</c> trancava o administrador para fora da API
+    /// inteira: login pela rota publica devolvia token valido, e toda rota
+    /// protegida devolvia 403. A matriz de autorizacao e explicita ao dizer que
+    /// as rotas de gestao exigem "JWT valido", nao "JWT de cliente".
+    /// </summary>
+    [Fact]
+    public void Validar_DeveAutorizarTokenDeAdministradorSemDocumento()
+    {
+        var token = GerarTokenBruto(
+            new Claim(JwtRegisteredClaimNames.Sub, "1000"),
+            new Claim(JwtRegisteredClaimNames.UniqueName, "admin"),
+            new Claim(ClaimTypes.Name, "Administrador"),
+            new Claim(ClaimTypes.Role, "Administrador"));
+
+        var resultado = CriarValidator().Validar(token);
+
+        Assert.True(resultado.Autorizado);
+        Assert.Equal("1000", resultado.Contexto["sub"]);
+        Assert.Equal("Administrador", resultado.Contexto["role"]);
+        Assert.False(resultado.Contexto.ContainsKey("documento"));
+    }
+
+    [Fact]
+    public void Validar_DeveRecusarTokenSemRole()
+    {
+        var token = GerarTokenBruto(
+            new Claim(JwtRegisteredClaimNames.Sub, "1000"),
+            new Claim("documento", "47654866801"));
+
+        var resultado = CriarValidator().Validar(token);
+
+        Assert.False(resultado.Autorizado);
+        Assert.Equal("Token sem as claims obrigatorias do contrato.", resultado.Motivo);
+    }
+
+    [Fact]
+    public void Validar_DeveRecusarTokenSemSub()
+    {
+        var token = GerarTokenBruto(new Claim(ClaimTypes.Role, "Cliente"));
+
+        var resultado = CriarValidator().Validar(token);
+
+        Assert.False(resultado.Autorizado);
+        Assert.Equal("Token sem as claims obrigatorias do contrato.", resultado.Motivo);
+    }
+
     [Fact]
     public void Validar_DeveRecusarTokenSemAsClaimsDoContrato()
     {
@@ -192,6 +242,22 @@ public sealed class JwtTokenValidatorTests
         Assert.DoesNotContain(payload.Claims, claim => claim.Type == "role");
         Assert.Contains(payload.Claims, claim => claim.Type == JwtRegisteredClaimNames.Sub);
         Assert.Contains(payload.Claims, claim => claim.Type == "documento");
+    }
+
+    /// <summary>
+    /// Emite um token assinado com a chave correta, mas com as claims que o
+    /// teste escolher - para reproduzir formatos que o JwtTokenGenerator nao
+    /// produz, como o do administrador, emitido pela API .NET.
+    /// </summary>
+    private static string GerarTokenBruto(params Claim[] claims)
+    {
+        var chave = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Chave));
+        return new JwtSecurityTokenHandler().WriteToken(new JwtSecurityToken(
+            issuer: Issuer,
+            audience: Audience,
+            claims: claims,
+            expires: DateTime.UtcNow.AddMinutes(60),
+            signingCredentials: new SigningCredentials(chave, SecurityAlgorithms.HmacSha256)));
     }
 
     private static JwtTokenValidator CriarValidator()
