@@ -262,6 +262,9 @@ jobs:
           # O id da conta vem em runtime: o repositorio e publico.
           CONTA="$(aws sts get-caller-identity --query Account --output text)"
           echo "funcao=tc-grupo160-auth-${SUFIXO}" >> "$GITHUB_OUTPUT"
+          # Segunda funcao, mesmo artefato, handler diferente. O nome casa com o
+          # que o Terraform monta em tech-challenge-infra-k8s (issue #43).
+          echo "authorizer=tc-grupo160-authorizer-${SUFIXO}" >> "$GITHUB_OUTPUT"
           echo "role=arn:aws:iam::${CONTA}:role/LabRole" >> "$GITHUB_OUTPUT"
           # Nome do segredo, nunca o valor. Criado pelo Terraform em
           # tech-challenge-infra-k8s (issue #46).
@@ -349,6 +352,65 @@ jobs:
       # O deploy que criou a funcao errada terminou verde: todos os passos
       # retornaram zero e a funcao de verdade continuou intocada. So uma
       # asercao sobre o estado final pega esse tipo de falha.
+      # ------------------------------------------------------ Lambda authorizer
+      #
+      # Mesmo artefato da funcao de autenticacao, publicado com outro nome e
+      # outro handler (issue #43). As duas leem a mesma chave, do mesmo segredo,
+      # pelo mesmo JwtOptions - e por isso que compartilham o projeto.
+      #
+      # FORA da VPC, de proposito, diferente da funcao de autenticacao. Ela
+      # precisa entrar na VPC para alcancar o RDS; o authorizer nao toca no
+      # banco, so le o segredo pela API do Secrets Manager. Manter fora evita a
+      # ENI e o custo de cold start que ela adiciona - e o authorizer roda em
+      # toda requisicao protegida, ainda que com cache de 300s no gateway.
+      - name: Deploy do authorizer
+        run: |
+          dotnet lambda deploy-function "${{ steps.alvo.outputs.authorizer }}" \
+            --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+            --configuration ${{ env.BUILD_CONFIGURATION }} \
+            --function-role "${{ steps.alvo.outputs.role }}" \
+            --function-handler "Fiap.TechChallenge.OficinaMecanica.AuthLambda::Fiap.TechChallenge.OficinaMecanica.AuthLambda.AuthorizerFunction::FunctionHandler" \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+      # Só o segredo do JWT: sem DB_SECRET_ID, porque o authorizer nao consulta
+      # o banco. Emissor e audiencia precisam bater com os da funcao que assina,
+      # senao todo token e recusado por issuer ou audience invalida.
+      - name: Configurar variaveis do authorizer
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.authorizer }}"
+          ENVS='{"Variables":{"JWT_SECRET_ID":"${{ steps.alvo.outputs.segredo_jwt }}","JWT_ISSUER":"Fiap.TechChallenge.OficinaMecanica","JWT_AUDIENCE":"Fiap.TechChallenge.OficinaMecanica"}}'
+
+          aws lambda wait function-updated --function-name "$FUNCAO"
+          aws lambda update-function-configuration \
+            --function-name "$FUNCAO" \
+            --environment "$ENVS" >/dev/null
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+      - name: Confirmar authorizer publicado
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.authorizer }}"
+          CONF="$(aws lambda get-function-configuration --function-name "$FUNCAO" --output json)"
+
+          falhas=0
+          for var in JWT_SECRET_ID JWT_ISSUER JWT_AUDIENCE; do
+            if ! echo "$CONF" | grep -q "\"$var\""; then
+              echo "::error::$var ausente na configuracao de $FUNCAO."
+              falhas=$((falhas + 1))
+            fi
+          done
+
+          # O handler errado e a falha mais provavel aqui: o artefato e o mesmo
+          # da funcao de autenticacao, e um handler trocado publicaria a funcao
+          # de login no lugar do authorizer, sem erro nenhum no deploy.
+          HANDLER="$(echo "$CONF" | grep -o '"Handler": *"[^"]*"' | head -1)"
+          echo "Handler: $HANDLER"
+          if ! echo "$HANDLER" | grep -q "AuthorizerFunction"; then
+            echo "::error::Handler de $FUNCAO nao aponta para AuthorizerFunction."
+            falhas=$((falhas + 1))
+          fi
+
+          exit $falhas
+
       - name: Confirmar funcao publicada
         run: |
           FUNCAO="${{ steps.alvo.outputs.funcao }}"
@@ -389,6 +451,7 @@ jobs:
             echo "| Item | Valor |"
             echo "|---|---|"
             echo "| Funcao | \`${{ steps.alvo.outputs.funcao }}\` |"
+            echo "| Authorizer | \`${{ steps.alvo.outputs.authorizer }}\` |"
             echo "| Ambiente | ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }} |"
             echo "| Regiao | ${{ vars.AWS_REGION || 'us-east-1' }} |"
             echo "| Segredo do JWT | \`${{ steps.alvo.outputs.segredo_jwt }}\` |"
