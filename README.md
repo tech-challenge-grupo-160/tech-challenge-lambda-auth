@@ -154,6 +154,81 @@ Os testes do validador emitem os tokens com o proprio `JwtTokenGenerator` em vez
 
 O `ClienteRepository` deve ser coberto por teste de integracao, pois consulta PostgreSQL real.
 
+## Deploy
+
+Nao ha Terraform das funcoes neste repositorio, e a ausencia e deliberada. As duas funcoes sao publicadas pelo `dotnet lambda deploy-function` (Amazon.Lambda.Tools); o Terraform de [tech-challenge-infra-k8s](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-k8s) cuida do que fica em volta delas. Descrever a mesma funcao nos dois lugares faria Terraform e pipeline disputarem o recurso: cada `apply` desfaria o ultimo deploy de codigo, e cada deploy deixaria o state defasado.
+
+| Quem | O que cria |
+|---|---|
+| `dotnet lambda deploy-function` | as funcoes `tc-grupo160-auth-<sufixo>` e `tc-grupo160-authorizer-<sufixo>` - codigo, runtime e handler |
+| `aws lambda update-function-configuration` | VPC da funcao de autenticacao e as variaveis de ambiente das duas |
+| Terraform (`infra-k8s`) | rota `POST /auth`, integracao, `aws_lambda_permission`, o authorizer do API Gateway, o segredo do JWT, subnets e security group |
+
+A ordem entre os dois nao e livre: **as funcoes precisam existir antes do `terraform apply`**. A `aws_lambda_permission` chama `AddPermission`, e a API devolve 404 quando a funcao nao esta publicada - o apply inteiro falha. Num ambiente ja em uso isso nunca aparece, porque as funcoes foram publicadas muito antes; numa conta do zero, aparece sempre.
+
+O sufixo do nome casa com `var.ambiente` do Terraform. Divergir aqui quebra a integracao em silencio: o gateway devolve 500 sem dizer que a funcao nao existe.
+
+| Ambiente (input do workflow) | Sufixo | Funcao de autenticacao | Authorizer |
+|---|---|---|---|
+| `desenvolvimento` | `dev` | `tc-grupo160-auth-dev` | `tc-grupo160-authorizer-dev` |
+| `homologacao` | `hom` | `tc-grupo160-auth-hom` | `tc-grupo160-authorizer-hom` |
+| `producao` | `prod` | `tc-grupo160-auth-prod` | `tc-grupo160-authorizer-prod` |
+
+### Pela pipeline
+
+O job `deploy` do [ci.yml](.github/workflows/ci.yml) roda por push em `homolog` e `main`, ou por `workflow_dispatch` a partir de qualquer branch - e assim que se publica em dev e assim que se valida o pipeline sem promover branch:
+
+```bash
+gh workflow run ci.yml --repo tech-challenge-grupo-160/tech-challenge-lambda-auth --ref develop -f ambiente=desenvolvimento
+```
+
+Ele publica as duas funcoes, resolve subnets e security group por tag em runtime, aplica as variaveis de ambiente e confere o resultado - inclusive se o handler do authorizer aponta mesmo para `AuthorizerFunction`.
+
+Exige `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN` nos secrets do repositorio. A credencial do Learner Lab e temporaria e troca a cada sessao; renove com `scripts/renova-secrets.sh` do repositorio da aplicacao. Sem elas o job de build segue util e apenas pula os passos de AWS, mas o de deploy falha de proposito.
+
+Se a rede do ambiente ainda nao existir, o deploy publica a funcao **fora da VPC** com um aviso, em vez de falhar. Ela sobe, mas nao alcanca o banco - aplique o Terraform de `infra-k8s` e rode de novo.
+
+### Pelo ambiente completo
+
+`scripts/sobe-tudo.sh`, no repositorio da aplicacao, sobe um ambiente do zero na ordem correta: funcoes Lambda, rede e gateway, banco, configuracao das funcoes, API no cluster e teste de fumaca em `POST /auth`.
+
+```bash
+./scripts/sobe-tudo.sh --ambiente dev
+```
+
+### A mao
+
+Util para republicar so o codigo, com a infraestrutura ja de pe:
+
+```bash
+CONTA="$(aws sts get-caller-identity --query Account --output text)"
+
+dotnet lambda deploy-function tc-grupo160-auth-dev \
+  --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+  --configuration Release \
+  --function-role "arn:aws:iam::${CONTA}:role/LabRole" \
+  --region us-east-1
+```
+
+O authorizer sai do **mesmo artefato**, mudando so o handler:
+
+```bash
+dotnet lambda deploy-function tc-grupo160-authorizer-dev \
+  --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+  --configuration Release \
+  --function-role "arn:aws:iam::${CONTA}:role/LabRole" \
+  --region us-east-1 \
+  --function-handler "Fiap.TechChallenge.OficinaMecanica.AuthLambda::Fiap.TechChallenge.OficinaMecanica.AuthLambda.AuthorizerFunction::FunctionHandler"
+```
+
+Tres armadilhas conhecidas, todas silenciosas:
+
+- **Esquecer o `--function-handler` no authorizer** publica a funcao de login com o nome do authorizer. O deploy termina verde e toda rota protegida passa a falhar.
+- **O `deploy-function` nao aplica VPC nem variaveis de ambiente.** Sem o `update-function-configuration` depois, a funcao de autenticacao sobe fora da VPC e nao alcanca o RDS. Rode `aws lambda wait function-updated` antes de alterar a configuracao: logo apos o deploy a funcao fica em `Pending` e a alteracao devolve `ResourceConflictException`.
+- **Nao passe parametro que o `deploy-function` nao documenta.** Ele nao reconhece `--subnets` nem `--security-groups`: em vez de recusar, tratou o id do security group como argumento posicional e criou uma funcao chamada `sg-09a565a4b2ca31faf`, deixando a funcao de verdade intocada e o job verde. Rede entra pelo AWS CLI, depois.
+
+A funcao de autenticacao fica **dentro** da VPC porque precisa alcancar o RDS em subnet privada; la ela perde a saida para a internet - nao ha NAT Gateway - e le o segredo pelo endpoint de interface do Secrets Manager. O authorizer fica **fora**, de proposito: nao toca no banco, e a ENI da VPC so somaria cold start a uma funcao que roda em toda requisicao protegida.
+
 ## Repositorios do projeto
 
 | Repositorio | Conteudo |
