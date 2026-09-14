@@ -1,76 +1,239 @@
 # tech-challenge-lambda-auth
 
-Function Serverless de autenticação por CPF do Sistema de Gestão de Oficina Mecânica — Tech Challenge SOAT, Fase 3.
+Function Serverless de autenticacao de cliente final do Sistema de Gestao de Oficina Mecanica - Tech Challenge SOAT, Fase 3.
 
-## Propósito
+## Proposito
 
-Este repositório contém a função serverless que fica atrás do API Gateway e responde pela autenticação:
+Este repositorio contem as duas funcoes que sustentam a autenticacao do cliente final: a que **emite** o token e a que o **valida** na borda do API Gateway.
 
-1. Valida o CPF informado (formato e dígitos verificadores)
-2. Consulta a existência e o status do cliente no banco de dados gerenciado
-3. Gera e devolve um token JWT válido para consumo das APIs protegidas
+| Funcao | Handler | Papel |
+|---|---|---|
+| Autenticacao | `Function::FunctionHandler` | Autentica por documento e emite o JWT |
+| Authorizer | `AuthorizerFunction::FunctionHandler` | Valida o JWT no API Gateway antes de o trafego chegar ao cluster |
 
-Nenhuma outra responsabilidade pertence a este repositório. Regras de negócio de oficina ficam na [aplicação principal](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica).
+As duas saem do **mesmo projeto e do mesmo artefato** - muda so o handler informado no deploy. E deliberado: ambas leem a mesma chave, do mesmo segredo, pelo mesmo `JwtOptions`. Separar em dois projetos duplicaria a resolucao do segredo, que e justamente onde uma divergencia entre elas passaria despercebida ate virar 401 em producao.
 
-## Status
+### Funcao de autenticacao
 
-> ⚠️ **Scaffold.** O runtime e a linguagem ainda não foram decididos — dependem da RFC de estratégia de autenticação ([issue #35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35)). Este README será completado quando a implementação começar.
+1. Receber a chamada via API Gateway com Lambda Proxy Integration.
+2. Validar CPF ou CNPJ, incluindo digitos verificadores.
+3. Consultar o cliente no PostgreSQL pela coluna `Cliente.CpfCnpj`.
+4. Validar se o cliente esta com status `Ativo`.
+5. Gerar e devolver um JWT com role `Cliente`.
+
+Regras administrativas da oficina continuam na API principal.
+
+### Funcao authorizer
+
+Lambda authorizer do API Gateway, no formato de payload 2.0 com resposta simples (`isAuthorized`). A escolha por Lambda authorizer em vez do authorizer JWT nativo esta na [RFC-0002](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/blob/develop/docs/rfcs/0002-autenticacao-por-cpf-e-api-gateway.md): o nativo exige emissor OIDC com JWKS publico e assinatura assimetrica, e o token deste projeto e HS256 com segredo compartilhado.
+
+1. Ler o header `Authorization` do evento, sem depender da caixa do nome.
+2. Validar assinatura, issuer, audience, expiracao e algoritmo do token.
+3. Conferir se as claims do contrato estao presentes.
+4. Responder `isAuthorized` e repassar `sub`, `documento` e `role` ao backend em `$context.authorizer`.
+
+Nao consulta o banco: decide sobre o token, nao sobre o cliente. O preco e a janela de ate 60 minutos em que um cliente desativado ainda passa - a mesma janela ja aceita pela API .NET, que tambem valida o token por conta propria (defesa em profundidade).
+
+O motivo de uma recusa vai para o log, nunca para a resposta: o gateway devolve apenas 401, sem corpo. Dizer a quem apresentou um token invalido se o problema foi a assinatura ou a expiracao ajuda quem esta tentando forjar um.
 
 ## Tecnologias
 
-| Item | Definição |
+| Item | Definicao |
 |---|---|
-| Runtime | A definir — RFC [#35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35) |
-| Provedor serverless | A definir — RFC [#56](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/56) |
-| Banco consultado | PostgreSQL gerenciado — provisionado em [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) |
-| Segredos | Gerenciador de segredos da nuvem (chave de assinatura do JWT) |
+| Runtime | .NET 10 |
+| Provider serverless | AWS Lambda |
+| Entrada HTTP | AWS API Gateway com Lambda Proxy Integration |
+| Banco consultado | PostgreSQL / AWS RDS |
+| Token | JWT assinado com HMAC SHA-256 |
 
 ## Contrato
 
-### Requisição
+Endpoint esperado no API Gateway:
 
+```http
+POST /api/v1/auth/cliente/login
 ```
-POST /auth
-{ "cpf": "12345678909" }
+
+Payload:
+
+```json
+{
+  "documento": "476.548.668-01"
+}
 ```
 
-### Respostas
+Tambem sao aceitos os aliases `cpfCnpj` e `cpf` por compatibilidade.
 
-| Código | Situação |
+Resposta de sucesso:
+
+```json
+{
+  "token": "...",
+  "expiraEm": "2026-08-17T23:58:02.8162589Z",
+  "nomeUsuario": "Vanessa Luna Duarte",
+  "role": "Cliente"
+}
+```
+
+## Configuracao
+
+Variaveis aceitas:
+
+| Variavel | Descricao |
 |---|---|
-| `200` | CPF válido e cliente ativo — retorna o JWT |
-| `400` | CPF inválido (formato ou dígito verificador) |
-| `403` | Cliente encontrado, porém inativo |
-| `404` | Cliente não encontrado |
+| `ConnectionStrings__DefaultConnection` ou `DATABASE_CONNECTION_STRING` | Connection string do PostgreSQL |
+| `Jwt__Issuer` ou `JWT_ISSUER` | Emissor do token |
+| `Jwt__Audience` ou `JWT_AUDIENCE` | Audiencia do token |
+| `Jwt__SecretId` ou `JWT_SECRET_ID` | **Nome** do segredo da chave no Secrets Manager. E o caminho usado na AWS |
+| `Jwt__SecretKey` ou `JWT_SECRET_KEY` | Chave de assinatura em claro. Apenas execucao local e testes |
+| `Jwt__ExpirationMinutes` ou `JWT_EXPIRATION_MINUTES` | Tempo de expiracao em minutos |
+| `DB_SECRET_ID` | Nome do segredo da credencial do banco no Secrets Manager |
 
-O formato e as claims do token são definidos na RFC [#35](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/35) e precisam ser aceitos pela API principal.
+A chave de assinatura tem duas origens, nesta ordem: `JWT_SECRET_ID` primeiro, `JWT_SECRET_KEY` depois. Sem nenhuma das duas a inicializacao falha - nao ha valor padrao, para que um deploy que esquecesse a variavel nao passasse a assinar tokens com uma chave publicada em repositorio aberto.
 
-## Execução local
+As duas funcoes usam a mesma chave. O authorizer precisa de `JWT_SECRET_ID` (ou `JWT_SECRET_KEY`), `JWT_ISSUER` e `JWT_AUDIENCE`; nao precisa de nenhuma variavel de banco.
 
-_A ser documentado junto com a implementação ([issue #36](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/36))._
+## Execucao local
+
+Com o Postgres local em Docker:
+
+```powershell
+dotnet lambda-test-tool-10.0 --project-location .\Fiap.TechChallenge.OficinaMecanica.AuthLambda
+```
+
+Exemplo de payload para o Mock Lambda Test Tool:
+
+```json
+{
+  "httpMethod": "POST",
+  "body": "{\"documento\":\"476.548.668-01\"}",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "path": "/api/v1/auth/cliente/login",
+  "resource": "/api/v1/auth/cliente/login",
+  "isBase64Encoded": false
+}
+```
+
+Payload para exercitar o **authorizer** no Mock Lambda Test Tool, apontando o handler para `AuthorizerFunction::FunctionHandler`. O token vai no header, com o esquema `Bearer`:
+
+```json
+{
+  "type": "REQUEST",
+  "routeKey": "GET /api/v1/ordens-servico",
+  "rawPath": "/api/v1/ordens-servico",
+  "headers": {
+    "authorization": "Bearer <token emitido pela funcao de autenticacao>"
+  }
+}
+```
+
+Resposta esperada para um token valido:
+
+```json
+{
+  "isAuthorized": true,
+  "context": {
+    "sub": "1000",
+    "documento": "47654866801",
+    "role": "Cliente"
+  }
+}
+```
+
+## Testes
+
+```powershell
+dotnet test .\tests\Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests\Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests.csproj
+```
+
+Os testes unitarios cobrem `Documento`, `AuthService`, `JwtTokenGenerator`, `JwtTokenValidator` e `AuthorizerFunction`.
+
+Os testes do validador emitem os tokens com o proprio `JwtTokenGenerator` em vez de usar strings fixas. E o ponto deles: gerador e validador sao as duas pontas do mesmo contrato, e uma mudanca em um que quebre o outro tem que aparecer no CI - nao em producao, no primeiro 401.
+
+O `ClienteRepository` deve ser coberto por teste de integracao, pois consulta PostgreSQL real.
 
 ## Deploy
 
-Deploy automático via GitHub Actions ([issue #50](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/issues/50)), autenticando na nuvem por OIDC — sem chave estática.
+Nao ha Terraform das funcoes neste repositorio, e a ausencia e deliberada. As duas funcoes sao publicadas pelo `dotnet lambda deploy-function` (Amazon.Lambda.Tools); o Terraform de [tech-challenge-infra-k8s](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-k8s) cuida do que fica em volta delas. Descrever a mesma funcao nos dois lugares faria Terraform e pipeline disputarem o recurso: cada `apply` desfaria o ultimo deploy de codigo, e cada deploy deixaria o state defasado.
 
-| Branch | Ambiente |
+| Quem | O que cria |
 |---|---|
-| `homolog` | Homologação |
-| `main` | Produção |
+| `dotnet lambda deploy-function` | as funcoes `tc-grupo160-auth-<sufixo>` e `tc-grupo160-authorizer-<sufixo>` - codigo, runtime e handler |
+| `aws lambda update-function-configuration` | VPC da funcao de autenticacao e as variaveis de ambiente das duas |
+| Terraform (`infra-k8s`) | rota `POST /auth`, integracao, `aws_lambda_permission`, o authorizer do API Gateway, o segredo do JWT, subnets e security group |
 
-## Arquitetura
+A ordem entre os dois nao e livre: **as funcoes precisam existir antes do `terraform apply`**. A `aws_lambda_permission` chama `AddPermission`, e a API devolve 404 quando a funcao nao esta publicada - o apply inteiro falha. Num ambiente ja em uso isso nunca aparece, porque as funcoes foram publicadas muito antes; numa conta do zero, aparece sempre.
 
-O diagrama de arquitetura na nuvem está em [docs/diagrams](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/blob/master/docs/diagrams) no repositório principal. Esta função é o componente **Lambda Auth**, em subnet privada.
+O sufixo do nome casa com `var.ambiente` do Terraform. Divergir aqui quebra a integracao em silencio: o gateway devolve 500 sem dizer que a funcao nao existe.
 
-## Repositórios do projeto
+| Ambiente (input do workflow) | Sufixo | Funcao de autenticacao | Authorizer |
+|---|---|---|---|
+| `desenvolvimento` | `dev` | `tc-grupo160-auth-dev` | `tc-grupo160-authorizer-dev` |
+| `homologacao` | `hom` | `tc-grupo160-auth-hom` | `tc-grupo160-authorizer-hom` |
+| `producao` | `prod` | `tc-grupo160-auth-prod` | `tc-grupo160-authorizer-prod` |
 
-| Repositório | Conteúdo |
+### Pela pipeline
+
+O job `deploy` do [ci.yml](.github/workflows/ci.yml) roda por push em `homolog` e `main`, ou por `workflow_dispatch` a partir de qualquer branch - e assim que se publica em dev e assim que se valida o pipeline sem promover branch:
+
+```bash
+gh workflow run ci.yml --repo tech-challenge-grupo-160/tech-challenge-lambda-auth --ref develop -f ambiente=desenvolvimento
+```
+
+Ele publica as duas funcoes, resolve subnets e security group por tag em runtime, aplica as variaveis de ambiente e confere o resultado - inclusive se o handler do authorizer aponta mesmo para `AuthorizerFunction`.
+
+Exige `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` e `AWS_SESSION_TOKEN` nos secrets do repositorio. A credencial do Learner Lab e temporaria e troca a cada sessao; renove com `scripts/renova-secrets.sh` do repositorio da aplicacao. Sem elas o job de build segue util e apenas pula os passos de AWS, mas o de deploy falha de proposito.
+
+Se a rede do ambiente ainda nao existir, o deploy publica a funcao **fora da VPC** com um aviso, em vez de falhar. Ela sobe, mas nao alcanca o banco - aplique o Terraform de `infra-k8s` e rode de novo.
+
+### Pelo ambiente completo
+
+`scripts/sobe-tudo.sh`, no repositorio da aplicacao, sobe um ambiente do zero na ordem correta: funcoes Lambda, rede e gateway, banco, configuracao das funcoes, API no cluster e teste de fumaca em `POST /auth`.
+
+```bash
+./scripts/sobe-tudo.sh --ambiente dev
+```
+
+### A mao
+
+Util para republicar so o codigo, com a infraestrutura ja de pe:
+
+```bash
+CONTA="$(aws sts get-caller-identity --query Account --output text)"
+
+dotnet lambda deploy-function tc-grupo160-auth-dev \
+  --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+  --configuration Release \
+  --function-role "arn:aws:iam::${CONTA}:role/LabRole" \
+  --region us-east-1
+```
+
+O authorizer sai do **mesmo artefato**, mudando so o handler:
+
+```bash
+dotnet lambda deploy-function tc-grupo160-authorizer-dev \
+  --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+  --configuration Release \
+  --function-role "arn:aws:iam::${CONTA}:role/LabRole" \
+  --region us-east-1 \
+  --function-handler "Fiap.TechChallenge.OficinaMecanica.AuthLambda::Fiap.TechChallenge.OficinaMecanica.AuthLambda.AuthorizerFunction::FunctionHandler"
+```
+
+Tres armadilhas conhecidas, todas silenciosas:
+
+- **Esquecer o `--function-handler` no authorizer** publica a funcao de login com o nome do authorizer. O deploy termina verde e toda rota protegida passa a falhar.
+- **O `deploy-function` nao aplica VPC nem variaveis de ambiente.** Sem o `update-function-configuration` depois, a funcao de autenticacao sobe fora da VPC e nao alcanca o RDS. Rode `aws lambda wait function-updated` antes de alterar a configuracao: logo apos o deploy a funcao fica em `Pending` e a alteracao devolve `ResourceConflictException`.
+- **Nao passe parametro que o `deploy-function` nao documenta.** Ele nao reconhece `--subnets` nem `--security-groups`: em vez de recusar, tratou o id do security group como argumento posicional e criou uma funcao chamada `sg-09a565a4b2ca31faf`, deixando a funcao de verdade intocada e o job verde. Rede entra pelo AWS CLI, depois.
+
+A funcao de autenticacao fica **dentro** da VPC porque precisa alcancar o RDS em subnet privada; la ela perde a saida para a internet - nao ha NAT Gateway - e le o segredo pelo endpoint de interface do Secrets Manager. O authorizer fica **fora**, de proposito: nao toca no banco, e a ENI da VPC so somaria cold start a uma funcao que roda em toda requisicao protegida.
+
+## Repositorios do projeto
+
+| Repositorio | Conteudo |
 |---|---|
-| [tech-challenge-oficina-mecanica](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica) | API .NET e documentação |
-| [tech-challenge-lambda-auth](https://github.com/tech-challenge-grupo-160/tech-challenge-lambda-auth) | Este repositório |
-| [tech-challenge-infra-k8s](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-k8s) | Terraform do cluster Kubernetes |
-| [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) | Terraform do banco gerenciado |
-
-## Contribuição
-
-Branch `main` protegida — sem commits diretos. Toda mudança entra por Pull Request com pelo menos uma aprovação.
+| [tech-challenge-oficina-mecanica](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica) | API .NET e documentacao |
+| [tech-challenge-lambda-auth](https://github.com/tech-challenge-grupo-160/tech-challenge-lambda-auth) | Esta Lambda de autenticacao |
+| [tech-challenge-infra-k8s](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-k8s) | Terraform da rede, do API Gateway e do cluster |
+| [tech-challenge-infra-database](https://github.com/tech-challenge-grupo-160/tech-challenge-infra-database) | Infraestrutura do banco gerenciado |

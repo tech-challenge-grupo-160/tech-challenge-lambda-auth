@@ -2,16 +2,46 @@
 node_modules/
 __pycache__/
 *.pyc
-bin/
-obj/
+[Bb]in/
+[Oo]bj/
+packages/
+project.lock.json
+project.assets.json
 
 # Build
 dist/
 build/
+artifacts/
+publish/
 *.zip
+*.nupkg
+*.snupkg
+*.deploy
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
 
 # Credenciais - nunca versionar
 .env
 .env.*
 *.pem
 *.key
+*.local.json
+
+# IDE / sistema operacional
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+_ReSharper*/
+*.DotSettings.user
+.history/
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
