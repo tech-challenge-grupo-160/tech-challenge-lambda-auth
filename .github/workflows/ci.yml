@@ -1,0 +1,468 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, homolog, main]
+  push:
+    branches: [develop, homolog, main]
+  workflow_dispatch:
+    inputs:
+      ambiente:
+        description: "Ambiente de destino do deploy"
+        type: choice
+        options: [desenvolvimento, homologacao, producao]
+        default: desenvolvimento
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  BUILD_CONFIGURATION: 'Release'
+  SOLUTION_FILE: 'Fiap.TechChallenge.OficinaMecanica.AuthLambda.slnx'
+  TEST_PROJECT: 'tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests/Fiap.TechChallenge.OficinaMecanica.AuthLambda.Tests.csproj'
+  COVERAGE_SETTINGS: 'coverlet.runsettings'
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write   # necessario para OIDC quando o deploy for habilitado (issue #54)
+
+jobs:
+  # Alem do build, este job cobre o que independe de linguagem: higiene do
+  # repositorio e ausencia de segredo commitado - critico porque o repositorio
+  # e publico.
+  hygiene:
+    name: Higiene do repositorio
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Arquivos obrigatorios presentes
+        run: |
+          fail=0
+          for f in README.md .gitignore .github/PULL_REQUEST_TEMPLATE.md; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Arquivo obrigatorio ausente: $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Nenhum arquivo de credencial versionado
+        run: |
+          # Repositorio publico: um .env ou .pem commitado vaza na hora.
+          found=$(git ls-files | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$|\.pfx$|id_rsa' || true)
+          if [ -n "$found" ]; then
+            echo "::error::Arquivos sensiveis versionados:"
+            echo "$found"
+            exit 1
+          fi
+          echo "OK - nenhum arquivo de credencial versionado."
+
+      - name: Nenhum segredo obvio no diff
+        if: github.event_name == 'pull_request'
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          # Os padroes ficam em arquivo separado, e esse arquivo e excluido do
+          # diff analisado: com as regex aqui dentro, o proprio workflow entrava
+          # no diff do PR e casava consigo mesmo, falhando o job.
+          # Heuristica simples, sem dependencia externa. Nao substitui uma
+          # ferramenta dedicada de secret scanning - ver issue #46.
+          # Referencias no formato ${{ secrets.X }} sao a forma correta de usar
+          # segredo em workflow: a linha aponta para o cofre, nao expoe o valor.
+          # Sem esta exclusao, configurar credenciais na AWS falha o proprio job.
+          hits=$(git diff "$base" "$head" -U0 \
+              -- . ':(exclude).github/secret-patterns.txt' \
+            | grep -E '^\+' \
+            | grep -v 'secrets\.' \
+            | grep -inE -f .github/secret-patterns.txt \
+            || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Possivel segredo no diff:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK - nada suspeito no diff."
+
+  workflows:
+    name: Sintaxe dos workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Valida YAML dos workflows
+        run: |
+          python3 - <<'PY'
+          import sys, glob, yaml
+          erros = 0
+          for f in glob.glob('.github/workflows/*.yml') + glob.glob('.github/workflows/*.yaml'):
+              try:
+                  yaml.safe_load(open(f, encoding='utf-8'))
+                  print(f'ok   {f}')
+              except Exception as e:
+                  print(f'ERRO {f}: {e}')
+                  erros += 1
+          sys.exit(1 if erros else 0)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Os jobs abaixo entram quando o runtime for definido na RFC (issue #35).
+  # Estao declarados para deixar explicito o que falta, e desabilitados para
+  # nao dar falsa sensacao de cobertura.
+  # ---------------------------------------------------------------------------
+
+  build:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    needs: [hygiene, workflows]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Show .NET information
+        run: dotnet --info
+
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+      - name: Build solution
+        run: >
+          dotnet build ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-restore
+
+      - name: Run unit tests
+        run: >
+          dotnet test ${{ env.TEST_PROJECT }}
+          --configuration ${{ env.BUILD_CONFIGURATION }}
+          --no-build
+          --no-restore
+          --verbosity normal
+          --collect:"XPlat Code Coverage"
+          --settings ${{ env.COVERAGE_SETTINGS }}
+          --logger "trx;LogFileName=unit-tests.trx"
+          --results-directory TestResults
+
+      - name: Resumo da cobertura
+        if: always()
+        run: |
+          file=$(find TestResults -name 'coverage.cobertura.xml' | head -1)
+          if [ -z "$file" ]; then
+            echo "::warning::Relatorio de cobertura nao encontrado."
+            exit 0
+          fi
+          # line-rate vem como fracao (ex.: 0.8123) no atributo raiz do cobertura
+          rate=$(grep -o 'line-rate="[0-9.]*"' "$file" | head -1 | grep -o '[0-9.]*')
+          pct=$(awk -v r="$rate" 'BEGIN { printf "%.1f", r * 100 }')
+          echo "Cobertura de linhas: ${pct}%"
+          echo "### Cobertura de linhas: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publica resultados dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/
+          retention-days: 7
+
+      # A credencial do Learner Lab e temporaria e trocada a cada sessao.
+      # Quando os secrets nao existem, os passos abaixo sao pulados em vez de
+      # falhar - assim o CI continua util sem depender de sessao ativa.
+      - name: Verifica se ha credenciais da sessao
+        id: creds
+        env:
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Sem credenciais da sessao. Cadastre os secrets - issue #54."
+          fi
+
+      - name: Autenticar na AWS
+        if: steps.creds.outputs.has == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Confirmar identidade na AWS
+        if: steps.creds.outputs.has == 'true'
+        run: |
+          # Prova de autenticacao exigida pela issue #54.
+          # A conta e mascarada: os repositorios sao publicos.
+          aws sts get-caller-identity --query 'Arn' --output text | sed 's/[0-9]\{12\}/<conta>/'
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    # Por push, so a partir das branches de ambiente: homolog publica hom e
+    # main publica prod. O workflow_dispatch publica o ambiente escolhido a
+    # partir de qualquer branch - e como se publica em dev, e como se valida o
+    # pipeline sem promover branch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (github.ref_name == 'homolog' || github.ref_name == 'main'))
+    environment: ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Diferente do job de build, aqui a credencial e obrigatoria: sem ela
+      # nao ha deploy. Falhar e o comportamento correto.
+      - name: Exige credenciais da sessao
+        env:
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::Sem credenciais da AWS. Rode scripts/renova-secrets.sh no repo de infra."
+            exit 1
+          fi
+
+      - name: Autenticar na AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Instalar Amazon.Lambda.Tools
+        run: dotnet tool install -g Amazon.Lambda.Tools
+
+      - name: Resolver nome da funcao e role
+        id: alvo
+        run: |
+          AMBIENTE="${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }}"
+          # O sufixo casa com var.ambiente do Terraform em infra-k8s: e dele que
+          # saem o nome da funcao (tc-grupo160-auth-<sufixo>) e o do segredo
+          # (tc-grupo160/<sufixo>/jwt-signing-key). Divergir aqui quebra a
+          # integracao do API Gateway silenciosamente.
+          case "$AMBIENTE" in
+            desenvolvimento) SUFIXO="dev" ;;
+            producao)        SUFIXO="prod" ;;
+            *)               SUFIXO="hom" ;;
+          esac
+          # O id da conta vem em runtime: o repositorio e publico.
+          CONTA="$(aws sts get-caller-identity --query Account --output text)"
+          echo "funcao=tc-grupo160-auth-${SUFIXO}" >> "$GITHUB_OUTPUT"
+          # Segunda funcao, mesmo artefato, handler diferente. O nome casa com o
+          # que o Terraform monta em tech-challenge-infra-k8s (issue #43).
+          echo "authorizer=tc-grupo160-authorizer-${SUFIXO}" >> "$GITHUB_OUTPUT"
+          echo "role=arn:aws:iam::${CONTA}:role/LabRole" >> "$GITHUB_OUTPUT"
+          # Nome do segredo, nunca o valor. Criado pelo Terraform em
+          # tech-challenge-infra-k8s (issue #46).
+          echo "segredo_jwt=tc-grupo160/${SUFIXO}/jwt-signing-key" >> "$GITHUB_OUTPUT"
+          # Credencial do banco, criada pelo Terraform em
+          # tech-challenge-infra-database (issue #61).
+          echo "segredo_banco=tc-grupo160/${SUFIXO}/banco" >> "$GITHUB_OUTPUT"
+          echo "sufixo=${SUFIXO}" >> "$GITHUB_OUTPUT"
+          echo "Ambiente: $AMBIENTE  Funcao: tc-grupo160-auth-${SUFIXO}"
+
+      # A funcao precisa entrar na VPC para alcancar o RDS, que fica em subnet
+      # privada sem acesso publico. Dentro da VPC ela perde a saida para a
+      # internet - nao ha NAT Gateway - e passa a depender do endpoint de
+      # interface do Secrets Manager, criado junto com a rede.
+      #
+      # Os ids sao descobertos por tag em runtime, e nao guardados em variavel
+      # do repositorio: mudariam a cada recriacao do ambiente do lab.
+      - name: Resolver rede da funcao
+        id: rede
+        run: |
+          SUFIXO="${{ steps.alvo.outputs.sufixo }}"
+          # JSON, nao shorthand: os ids vao para --vpc-config do AWS CLI, e a
+          # forma shorthand com lista separada por virgula e ambigua.
+          SUBNETS="$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-privada-*" \
+            --query 'Subnets[].SubnetId' --output json | tr -d ' \n')"
+          SG="$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=tc-grupo160-${SUFIXO}-lambda" \
+            --query 'SecurityGroups[0].GroupId' --output text)"
+
+          if [ "$SUBNETS" = "[]" ] || [ -z "$SUBNETS" ] || [ "$SG" = "None" ] || [ -z "$SG" ]; then
+            # Sem rede aplicada nao ha banco para alcancar tambem, entao publicar
+            # fora da VPC mantem o pipeline util em vez de falhar.
+            echo "::warning::Rede do ambiente ${SUFIXO} nao encontrada. Publicando fora da VPC - a funcao nao alcancara o banco. Aplique o Terraform de tech-challenge-infra-k8s."
+            echo "vpc=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "vpc=true" >> "$GITHUB_OUTPUT"
+            echo "vpc_config={\"SubnetIds\":${SUBNETS},\"SecurityGroupIds\":[\"${SG}\"]}" >> "$GITHUB_OUTPUT"
+            echo "sg=$SG" >> "$GITHUB_OUTPUT"
+            echo "Subnets: $SUBNETS  SG: $SG"
+          fi
+
+      # Publica apenas o codigo. Rede e variaveis entram no passo seguinte, pelo
+      # AWS CLI.
+      #
+      # O deploy-function nao reconhece --subnets nem --security-groups: em vez
+      # de recusar, tratou o id do security group como argumento posicional e
+      # criou uma funcao chamada "sg-09a565a4b2ca31faf", deixando a funcao de
+      # verdade intocada e o job verde. Nao passe parametro que a ferramenta nao
+      # documenta aqui.
+      - name: Deploy da funcao
+        run: |
+          # deploy-function cria ou atualiza, entao serve para os dois casos.
+          dotnet lambda deploy-function "${{ steps.alvo.outputs.funcao }}" \
+            --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+            --configuration ${{ env.BUILD_CONFIGURATION }} \
+            --function-role "${{ steps.alvo.outputs.role }}" \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+      # As duas variaveis carregam NOMES de segredo. Nenhuma credencial trafega
+      # aqui nem fica visivel na configuracao da funcao.
+      - name: Configurar rede e variaveis de ambiente
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.funcao }}"
+          ENVS='{"Variables":{"JWT_SECRET_ID":"${{ steps.alvo.outputs.segredo_jwt }}","DB_SECRET_ID":"${{ steps.alvo.outputs.segredo_banco }}"}}'
+
+          # A funcao fica em Pending logo apos o deploy do codigo; alterar a
+          # configuracao antes disso devolve ResourceConflictException.
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+            aws lambda update-function-configuration \
+              --function-name "$FUNCAO" \
+              --environment "$ENVS" \
+              --vpc-config '${{ steps.rede.outputs.vpc_config }}' >/dev/null
+          else
+            aws lambda update-function-configuration \
+              --function-name "$FUNCAO" \
+              --environment "$ENVS" >/dev/null
+          fi
+
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+      # Verifica o resultado, nao so o codigo de saida dos passos anteriores.
+      # O deploy que criou a funcao errada terminou verde: todos os passos
+      # retornaram zero e a funcao de verdade continuou intocada. So uma
+      # asercao sobre o estado final pega esse tipo de falha.
+      # ------------------------------------------------------ Lambda authorizer
+      #
+      # Mesmo artefato da funcao de autenticacao, publicado com outro nome e
+      # outro handler (issue #43). As duas leem a mesma chave, do mesmo segredo,
+      # pelo mesmo JwtOptions - e por isso que compartilham o projeto.
+      #
+      # FORA da VPC, de proposito, diferente da funcao de autenticacao. Ela
+      # precisa entrar na VPC para alcancar o RDS; o authorizer nao toca no
+      # banco, so le o segredo pela API do Secrets Manager. Manter fora evita a
+      # ENI e o custo de cold start que ela adiciona - e o authorizer roda em
+      # toda requisicao protegida, ainda que com cache de 300s no gateway.
+      - name: Deploy do authorizer
+        run: |
+          dotnet lambda deploy-function "${{ steps.alvo.outputs.authorizer }}" \
+            --project-location Fiap.TechChallenge.OficinaMecanica.AuthLambda \
+            --configuration ${{ env.BUILD_CONFIGURATION }} \
+            --function-role "${{ steps.alvo.outputs.role }}" \
+            --function-handler "Fiap.TechChallenge.OficinaMecanica.AuthLambda::Fiap.TechChallenge.OficinaMecanica.AuthLambda.AuthorizerFunction::FunctionHandler" \
+            --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+      # Só o segredo do JWT: sem DB_SECRET_ID, porque o authorizer nao consulta
+      # o banco. Emissor e audiencia precisam bater com os da funcao que assina,
+      # senao todo token e recusado por issuer ou audience invalida.
+      - name: Configurar variaveis do authorizer
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.authorizer }}"
+          ENVS='{"Variables":{"JWT_SECRET_ID":"${{ steps.alvo.outputs.segredo_jwt }}","JWT_ISSUER":"Fiap.TechChallenge.OficinaMecanica","JWT_AUDIENCE":"Fiap.TechChallenge.OficinaMecanica"}}'
+
+          aws lambda wait function-updated --function-name "$FUNCAO"
+          aws lambda update-function-configuration \
+            --function-name "$FUNCAO" \
+            --environment "$ENVS" >/dev/null
+          aws lambda wait function-updated --function-name "$FUNCAO"
+
+      - name: Confirmar authorizer publicado
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.authorizer }}"
+          CONF="$(aws lambda get-function-configuration --function-name "$FUNCAO" --output json)"
+
+          falhas=0
+          for var in JWT_SECRET_ID JWT_ISSUER JWT_AUDIENCE; do
+            if ! echo "$CONF" | grep -q "\"$var\""; then
+              echo "::error::$var ausente na configuracao de $FUNCAO."
+              falhas=$((falhas + 1))
+            fi
+          done
+
+          # O handler errado e a falha mais provavel aqui: o artefato e o mesmo
+          # da funcao de autenticacao, e um handler trocado publicaria a funcao
+          # de login no lugar do authorizer, sem erro nenhum no deploy.
+          HANDLER="$(echo "$CONF" | grep -o '"Handler": *"[^"]*"' | head -1)"
+          echo "Handler: $HANDLER"
+          if ! echo "$HANDLER" | grep -q "AuthorizerFunction"; then
+            echo "::error::Handler de $FUNCAO nao aponta para AuthorizerFunction."
+            falhas=$((falhas + 1))
+          fi
+
+          exit $falhas
+
+      - name: Confirmar funcao publicada
+        run: |
+          FUNCAO="${{ steps.alvo.outputs.funcao }}"
+          CONF="$(aws lambda get-function-configuration --function-name "$FUNCAO" --output json)"
+
+          aws lambda get-function \
+            --function-name "$FUNCAO" \
+            --query '{Nome:Configuration.FunctionName,Runtime:Configuration.Runtime,Estado:Configuration.State,Tamanho:Configuration.CodeSize}' \
+            --output table
+
+          falhas=0
+          for var in JWT_SECRET_ID DB_SECRET_ID; do
+            if ! echo "$CONF" | grep -q "\"$var\""; then
+              echo "::error::$var ausente na configuracao de $FUNCAO."
+              falhas=$((falhas + 1))
+            fi
+          done
+
+          if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+            if ! echo "$CONF" | grep -q "${{ steps.rede.outputs.sg }}"; then
+              echo "::error::A funcao $FUNCAO nao ficou na VPC: security group ${{ steps.rede.outputs.sg }} ausente."
+              falhas=$((falhas + 1))
+            fi
+          fi
+
+          # Uma funcao publicada ha muito tempo significa que o deploy foi para
+          # outro lugar - foi exatamente o sintoma da funcao "sg-...".
+          MOD="$(echo "$CONF" | grep -o '"LastModified": *"[^"]*"' | head -1)"
+          echo "Ultima modificacao: $MOD"
+
+          exit $falhas
+
+      - name: Resumo
+        run: |
+          {
+            echo "### Deploy concluido"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Funcao | \`${{ steps.alvo.outputs.funcao }}\` |"
+            echo "| Authorizer | \`${{ steps.alvo.outputs.authorizer }}\` |"
+            echo "| Ambiente | ${{ inputs.ambiente || (github.ref_name == 'main' && 'producao' || 'homologacao') }} |"
+            echo "| Regiao | ${{ vars.AWS_REGION || 'us-east-1' }} |"
+            echo "| Segredo do JWT | \`${{ steps.alvo.outputs.segredo_jwt }}\` |"
+            echo "| Segredo do banco | \`${{ steps.alvo.outputs.segredo_banco }}\` |"
+            echo "| Dentro da VPC | ${{ steps.rede.outputs.vpc }} |"
+            if [ "${{ steps.rede.outputs.vpc }}" = "true" ]; then
+              echo "| Subnets | \`${{ steps.rede.outputs.subnets }}\` |"
+              echo "| Security group | \`${{ steps.rede.outputs.sg }}\` |"
+            else
+              echo ""
+              echo "> Publicada **fora da VPC**: a rede do ambiente nao foi encontrada."
+              echo "> A funcao nao alcanca o banco. Aplique o Terraform de tech-challenge-infra-k8s."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
