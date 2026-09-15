@@ -221,13 +221,14 @@ dotnet lambda deploy-function tc-grupo160-authorizer-dev \
   --function-handler "Fiap.TechChallenge.OficinaMecanica.AuthLambda::Fiap.TechChallenge.OficinaMecanica.AuthLambda.AuthorizerFunction::FunctionHandler"
 ```
 
-Tres armadilhas conhecidas, todas silenciosas:
+Quatro armadilhas conhecidas, todas silenciosas:
 
+- **O `update-function-configuration --environment` substitui o mapa inteiro de variaveis.** Numa funcao instrumentada com o Datadog pelo `sobe-tudo.sh`, ele apaga as `DD_*` e o `AWS_LAMBDA_EXEC_WRAPPER`: as camadas do Datadog continuam la, mas os traces param. O deploy pela pipeline faz exatamente isso. Para instrumentar de novo, rode o `sobe-tudo.sh` do repositorio da aplicacao.
 - **Esquecer o `--function-handler` no authorizer** publica a funcao de login com o nome do authorizer. O deploy termina verde e toda rota protegida passa a falhar.
 - **O `deploy-function` nao aplica VPC nem variaveis de ambiente.** Sem o `update-function-configuration` depois, a funcao de autenticacao sobe fora da VPC e nao alcanca o RDS. Rode `aws lambda wait function-updated` antes de alterar a configuracao: logo apos o deploy a funcao fica em `Pending` e a alteracao devolve `ResourceConflictException`.
 - **Nao passe parametro que o `deploy-function` nao documenta.** Ele nao reconhece `--subnets` nem `--security-groups`: em vez de recusar, tratou o id do security group como argumento posicional e criou uma funcao chamada `sg-09a565a4b2ca31faf`, deixando a funcao de verdade intocada e o job verde. Rede entra pelo AWS CLI, depois.
 
-A funcao de autenticacao fica **dentro** da VPC porque precisa alcancar o RDS em subnet privada; la ela perde a saida para a internet - nao ha NAT Gateway - e le o segredo pelo endpoint de interface do Secrets Manager. O authorizer fica **fora**, de proposito: nao toca no banco, e a ENI da VPC so somaria cold start a uma funcao que roda em toda requisicao protegida.
+A funcao de autenticacao fica **dentro** da VPC porque precisa alcancar o RDS em subnet privada; la a saida para a internet passa pelo NAT Gateway da VPC, mas o segredo e lido pelo endpoint de interface do Secrets Manager, sem sair da rede privada. O authorizer fica **fora**, de proposito: nao toca no banco, e a ENI da VPC so somaria cold start a uma funcao que roda em toda requisicao protegida.
 
 ## Repositorios do projeto
 
