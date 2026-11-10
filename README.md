@@ -190,11 +190,13 @@ Se a rede do ambiente ainda nao existir, o deploy publica a funcao **fora da VPC
 
 ### Pelo ambiente completo
 
-`scripts/sobe-tudo.sh`, no repositorio da aplicacao, sobe um ambiente do zero na ordem correta: funcoes Lambda, rede e gateway, banco, configuracao das funcoes, API no cluster e teste de fumaca em `POST /auth`.
+`scripts/sobe-tudo.sh`, no repositorio da aplicacao, sobe um ambiente do zero na ordem correta. As funcoes deste repositorio entram em dois momentos: o codigo na etapa 2, antes do gateway, porque a permissao de invocacao exige a funcao publicada, e a rede e as variaveis na etapa 7, depois que subnets, security groups e segredos existem. A lista das dez etapas e o roteiro para quem sobe pela primeira vez estao no [CICLO-DE-VIDA.md](https://github.com/tech-challenge-grupo-160/tech-challenge-oficina-mecanica/blob/develop/docs/CICLO-DE-VIDA.md#roteiro-rápido).
 
 ```bash
 ./scripts/sobe-tudo.sh --ambiente dev
 ```
+
+O `derruba-tudo.sh` remove as funcoes primeiro: elas nao estao em nenhum Terraform, e um `terraform destroy` nao as levaria.
 
 ### A mao
 
